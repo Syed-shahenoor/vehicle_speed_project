@@ -3,10 +3,11 @@ import math
 import csv
 from ultralytics import YOLO
 import time
+import platform
+import os
 
-# Constants
-SPEED_LIMIT_KMPH = 60  # Overspeed threshold
-PIXEL_TO_METER_RATIO = 0.05  # Approx. distance a vehicle moves per pixel
+# OS beep detection
+IS_WINDOWS = platform.system() == "Windows"
 
 # Load YOLOv8 model
 model = YOLO("yolov8n.pt")
@@ -17,14 +18,28 @@ if not cap.isOpened():
     print("Error opening video file")
     exit()
 
+# Calibration constants
+PIXEL_DISTANCE = 250  # Pixels between 2 real points (manual)
+REAL_DISTANCE = 10    # Real distance in meters
+PIXEL_TO_METER_RATIO = REAL_DISTANCE / PIXEL_DISTANCE
+print(f"Using calibrated PIXEL_TO_METER_RATIO: {PIXEL_TO_METER_RATIO:.5f}")
+
+SPEED_LIMIT_KMPH = 60
+
+# Frame info
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+DETECTION_LINE_Y = int(frame_height * 0.90)  # Logic line (speed check)
+VISIBLE_LINE_Y = 420  # 👁️ Visible line (drawn higher for visibility)
+
 # CSV setup
 csv_file = open("vehicle_speeds.csv", mode="w", newline="")
 csv_writer = csv.writer(csv_file)
-csv_writer.writerow(["Frame", "Vehicle", "Speed (km/h)", "Overspeed"])
+csv_writer.writerow(["Frame", "Vehicle ID", "Vehicle", "Speed (km/h)", "Overspeed"])
 
-# Variables for tracking
+# Tracking
 prev_centroids = {}
 frame_count = 0
+beeped_ids = set()
 
 while True:
     ret, frame = cap.read()
@@ -34,6 +49,11 @@ while True:
     frame_count += 1
     results = model.track(frame, persist=True, tracker="bytetrack.yaml")[0]
     current_centroids = {}
+
+    # Draw visible purple line (visual only)
+    cv2.line(frame, (0, VISIBLE_LINE_Y), (frame.shape[1], VISIBLE_LINE_Y), (255, 0, 255), 2)
+    cv2.putText(frame, "Speed Detection Line", (10, VISIBLE_LINE_Y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
     if results.boxes.id is not None:
         ids = results.boxes.id.cpu().numpy().astype(int)
@@ -48,10 +68,10 @@ while True:
             cy = int((y1 + y2) / 2)
             current_centroids[track_id] = (cx, cy)
 
-            # Draw bounding box
+            # Draw green box
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-            # Calculate speed if we have seen this ID before
+            # ✅ Calculate speed if tracked before
             if track_id in prev_centroids:
                 prev_cx, prev_cy = prev_centroids[track_id]
                 pixel_distance = math.hypot(cx - prev_cx, cy - prev_cy)
@@ -60,28 +80,40 @@ while True:
                 speed_mps = meters_moved * fps
                 speed_kmph = speed_mps * 3.6
 
-                # Draw speed on frame
+                # ✅ Show speed always
                 cv2.putText(frame, f"{int(speed_kmph)} km/h", (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-                # Overspeeding check
-                if speed_kmph > SPEED_LIMIT_KMPH:
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)  # Red box
+                # ✅ Overspeed check
+                is_overspeed = speed_kmph > SPEED_LIMIT_KMPH
 
-                # Log to CSV
-                csv_writer.writerow([
-                    frame_count,
-                    model.names[cls],
-                    round(speed_kmph, 2),
-                    "Yes" if speed_kmph > SPEED_LIMIT_KMPH else "No"
-                ])
+                # ✅ Log + Beep only when crossing detection line
+                if cy >= DETECTION_LINE_Y:
+                    if is_overspeed:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                        if track_id not in beeped_ids:
+                            if IS_WINDOWS:
+                                import winsound
+                                winsound.Beep(1000, 200)
+                            else:
+                                os.system('play -nq -t alsa synth 0.2 sine 1000')
+                            beeped_ids.add(track_id)
 
-            # Label with class name
+                    # ✅ Log in CSV (fixed to log proper Yes/No)
+                    csv_writer.writerow([
+                        frame_count,
+                        track_id,
+                        model.names[cls],
+                        round(speed_kmph, 2),
+                        "Yes" if is_overspeed else "No"
+                    ])
+
+            # Vehicle label
             label = model.names[cls]
             cv2.putText(frame, label, (x1, y2 + 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-    # Show frame
+    # Show output
     cv2.imshow("Vehicle Speed Detection", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
